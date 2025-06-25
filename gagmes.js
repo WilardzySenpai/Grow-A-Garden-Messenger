@@ -20,54 +20,84 @@ const COLLECTION_NAME = 'subscribers';
 let dbClient;
 let db;
 
-// Function to connect to MongoDB
-async function connectToDatabase() {
-    if (db && dbClient && dbClient.topology && dbClient.topology.isConnected()) {
-        return db;
-    }
-    try {
-        dbClient = new MongoClient(MONGODB_URI);
-        await dbClient.connect();
-        db = dbClient.db(DB_NAME);
-        console.log("Successfully connected to MongoDB.");
-        return db;
-    } catch (error) {
-        console.error("Could not connect to MongoDB:", error);
-        throw error;
-    }
-}
+// --- WebSocket Configuration & State ---
+const WS_URL = 'wss://websocket.joshlei.com/growagarden/?user_id=1377463641078497401';
+const MAX_RECONNECT_ATTEMPTS = 10;
+const INITIAL_RECONNECT_DELAY = 1000; // 1 second
+const MAX_RECONNECT_DELAY = 30000;   // 30 seconds
+const HEARTBEAT_INTERVAL_MS = 30000; // 30 seconds
+
+let wsClient = null; // Renamed from 'ws' to avoid conflict with WebSocket module itself if used as 'new ws.WebSocket(...)'
+let reconnectAttempt = 0;
+let isWsConnected = false;
+let heartbeatInterval = null;
+
 
 // Item definitions for filtering messages from the external WebSocket
-const RARE_ITEMS = { // display_names of items considered rare
+const RARE_ITEMS = {
     normal: ['Basic Sprinkler', 'Advanced Sprinkler', 'Grape', 'Mushroom', 'Pepper', 'Cacao', 'Legendary Egg', 'Mythical Egg', 'Bee Egg'],
     priority: ['Beanstalk', 'Ember Lily', 'Sugar Apple', 'Feijoa', 'Loquat', 'Godly Sprinkler', 'Master Sprinkler', 'Bug Egg']
 };
-const SUMMER_SEEDS = ['Cauliflower', 'Green Apple', 'Avocado', 'Banana', 'Pineapple', 'Bell Pepper', 'Prickly pear', 'Kiwi', 'Feijoa', 'Loquat']; // display_names
+const SUMMER_SEEDS = ['Cauliflower', 'Green Apple', 'Avocado', 'Banana', 'Pineapple', 'Bell Pepper', 'Prickly pear', 'Kiwi', 'Feijoa', 'Loquat'];
 
 function isRareItem(itemName) {
     return RARE_ITEMS.normal.includes(itemName) || RARE_ITEMS.priority.includes(itemName);
 }
+function isPriorityRareItem(itemName) {
+    return RARE_ITEMS.priority.includes(itemName);
+}
 
-// Local cache for current stock information (from external WebSocket)
+// Local cache for current stock information (for new subscribers)
 let currentStockCache = {
-    latestRareItem: null,    // Will store the full item object: { display_name, quantity, item_id, ... }
-    latestSummerSeed: null // Will store the full item object
+    latestRareItem: null,
+    latestSummerSeed: null
 };
 
 class BotLogger {
-    constructor() { /* ... */ }
+    constructor() { /* Basic constructor */ }
     log(type, message, data = {}) { const timestamp = new Date().toISOString(); const logEntry = { timestamp, type, message, ...data }; console.log(JSON.stringify(logEntry)); }
 }
 const logger = new BotLogger();
 
-// Facebook Messenger specific functions
+// --- Utility Functions ---
+function formatTimeRemaining(endTimeUnix) {
+    if (!endTimeUnix || !Number.isFinite(endTimeUnix)) return "Time unknown";
+    const now = Math.floor(Date.now() / 1000);
+    const remaining = endTimeUnix - now;
+    if (remaining <= 0) return "Expired";
+    const h = Math.floor(remaining / 3600);
+    const m = Math.floor((remaining % 3600) / 60);
+    const s = remaining % 60;
+    let parts = [];
+    if (h > 0) parts.push(`${h}h`);
+    if (m > 0) parts.push(`${m}m`);
+    parts.push(`${s}s`);
+    return parts.join(' ');
+}
+
+// --- MongoDB Connection ---
+async function connectToDatabase() {
+    if (db && dbClient && dbClient.topology && dbClient.topology.isConnected()) return db;
+    try {
+        dbClient = new MongoClient(MONGODB_URI);
+        await dbClient.connect();
+        db = dbClient.db(DB_NAME);
+        logger.log('INFO', "Successfully connected to MongoDB.");
+        return db;
+    } catch (error) {
+        logger.log('ERROR', "Could not connect to MongoDB:", { error: error.message });
+        throw error;
+    }
+}
+
+// --- Facebook Messenger API Functions ---
 async function sendTextMessage(senderId, text) {
-    logger.log('info', `Attempting to send message to Facebook User ${senderId}: "${text}"`);
+    logger.log('INFO', `Attempting to send FB message to ${senderId}: "${text.substring(0,100)}..."`);
     const messageData = { messaging_type: 'RESPONSE', recipient: { id: senderId }, message: { text: text } };
     try {
         await callSendAPI(messageData);
     } catch (error) {
-        logger.log('error', `Error in sendTextMessage for Facebook User ${senderId}:`, { error: error.message, stack: error.stack });
+        logger.log('ERROR', `Error in sendTextMessage for FB User ${senderId}:`, { error: error.message });
     }
 }
 
@@ -80,108 +110,206 @@ function callSendAPI(messageData) {
             json: messageData
         }, (error, response, body) => {
             if (!error && response.statusCode >= 200 && response.statusCode < 300) {
-                logger.log('info', 'Message sent successfully to Facebook API', { recipient: messageData.recipient.id });
+                logger.log('SUCCESS', 'Message sent successfully to Facebook API', { recipient: messageData.recipient.id });
                 resolve(body);
             } else {
-                const errorDetail = { message: error ? error.message : "Unknown error", statusCode: response ? response.statusCode : "N/A", body };
-                logger.log('error', 'Error sending message via Facebook API:', errorDetail);
-                reject(error || new Error(`Failed to send message, status: ${response ? response.statusCode : 'N/A'}`));
+                const errorDetail = { message: error ? error.message : "FB API Error", statusCode: response ? response.statusCode : "N/A", body };
+                logger.log('ERROR', 'Error sending message via Facebook API:', errorDetail);
+                reject(error || new Error(`FB API Error, status: ${response ? response.statusCode : 'N/A'}`));
             }
         });
     });
 }
 
-// WebSocket connection to EXTERNAL game update service
-const ws = new WebSocket('wss://websocket.joshlei.com/growagarden/?user_id=1377463641078497401');
+// --- WebSocket Management ---
+function calculateRetryDelay(attempt) {
+    const delay = Math.min(INITIAL_RECONNECT_DELAY * Math.pow(2, attempt), MAX_RECONNECT_DELAY);
+    return delay + Math.random() * 1000; // Add jitter
+}
 
-ws.on('open', () => {
-    logger.log('info', 'EXTERNAL WebSocket connection established.');
-});
+function startHeartbeat() {
+    if (heartbeatInterval) clearInterval(heartbeatInterval);
+    heartbeatInterval = setInterval(() => {
+        if (wsClient && wsClient.readyState === WebSocket.OPEN) {
+            wsClient.ping(() => {}); // Optional callback for ping
+            logger.log('DEBUG', 'WebSocket Heartbeat Ping Sent');
+        }
+    }, HEARTBEAT_INTERVAL_MS);
+}
 
-ws.on('message', async (data) => {
+function connectWebSocket() {
+    if (wsClient) {
+        wsClient.removeAllListeners();
+        wsClient.terminate();
+        wsClient = null;
+    }
+    logger.log('INFO', `Attempting to connect to WebSocket: ${WS_URL}`);
+    wsClient = new WebSocket(WS_URL);
+
+    wsClient.on('open', () => {
+        logger.log('SUCCESS', 'EXTERNAL WebSocket connection established.');
+        isWsConnected = true;
+        reconnectAttempt = 0;
+        startHeartbeat();
+    });
+
+    wsClient.on('message', async (data) => {
+        // This is where the main logic from your Telegram bot's handleMessage will go
+        await handleExternalWebSocketMessage(data);
+    });
+
+    wsClient.on('pong', () => {
+        logger.log('DEBUG', 'WebSocket Heartbeat Pong Received');
+    });
+
+    wsClient.on('error', (error) => {
+        logger.log('ERROR', 'EXTERNAL WebSocket error:', { error: error.message });
+        // isWsConnected will be set to false in 'close' event
+    });
+
+    wsClient.on('close', (code, reason) => {
+        isWsConnected = false;
+        if (heartbeatInterval) clearInterval(heartbeatInterval);
+        heartbeatInterval = null;
+        const reasonStr = reason ? reason.toString() : "No reason provided";
+        logger.log('WARNING', 'EXTERNAL WebSocket closed.', { code, reason: reasonStr, reconnectAttempt });
+
+        if (reconnectAttempt < MAX_RECONNECT_ATTEMPTS) {
+            const delay = calculateRetryDelay(reconnectAttempt);
+            logger.log('INFO', `Will attempt to reconnect WebSocket in ${delay.toFixed(0)}ms (Attempt: ${reconnectAttempt + 1})`);
+            setTimeout(() => {
+                reconnectAttempt++;
+                connectWebSocket();
+            }, delay);
+        } else {
+            logger.log('ERROR', 'Maximum WebSocket reconnection attempts reached. Further reconnections require manual intervention or restart.');
+        }
+    });
+}
+
+// --- Main Handler for External WebSocket Messages ---
+async function handleExternalWebSocketMessage(data) {
     const rawDataString = data.toString();
-    logger.log('info', 'RAW EXTERNAL WebSocket Data Received:', { shortData: rawDataString.substring(0, 200) + "..." }); // Log ALL data (shortened for brevity here)
+    logger.log('DEBUG', 'RAW EXTERNAL WebSocket Data Received:', { shortData: rawDataString.substring(0, 300) + "..." });
 
     try {
-        const fullStockUpdate = JSON.parse(rawDataString);
+        const stockData = JSON.parse(rawDataString); // Renamed for clarity
 
-        let foundRareItemForBroadcast = null;
-        let foundSummerSeedForBroadcast = null;
+        // Helper to format item list for a category
+        const formatItemList = (items, categoryTitle) => {
+            if (!Array.isArray(items) || items.length === 0) return null;
+            let message = `--- ${categoryTitle} ---\n`;
+            items.forEach(item => {
+                message += `🔸 ${item.display_name}\n`;
+                message += `   Qty: ${item.quantity}\n`;
+                message += `   Ends: ${formatTimeRemaining(item.end_date_unix)}\n\n`;
+            });
+            return message;
+        };
 
-        const stockKeysToCheck = ['seed_stock', 'gear_stock', 'egg_stock', 'cosmetic_stock', 'eventshop_stock'];
+        // Process and broadcast each category
+        const weather = stockData.weather ? stockData.weather.find(w => w.active) : null;
+        if (weather) {
+            const weatherMsg = `--- WEATHER UPDATE ---\n` +
+                               `🌟 Current: ${weather.weather_name}\n` +
+                               `⏰ Ends in: ${formatTimeRemaining(weather.end_duration_unix)}\n`;
+            await broadcastToSubscribers(weatherMsg, 'weather_update');
+        }
 
-        for (const key of stockKeysToCheck) {
-            if (Array.isArray(fullStockUpdate[key])) {
-                for (const item of fullStockUpdate[key]) {
-                    if (item && item.display_name) {
-                        // Check for Rare Items
-                        if (isRareItem(item.display_name)) {
-                            logger.log('info', 'Found Rare Item in WebSocket data:', { name: item.display_name, qty: item.quantity });
-                            currentStockCache.latestRareItem = { ...item }; // Cache it
-                            if (!foundRareItemForBroadcast) { // Broadcast only the first one found in this update
-                                foundRareItemForBroadcast = item;
-                            }
-                        }
-                        // Check for Summer Seeds (only in seed_stock)
-                        if (key === 'seed_stock' && SUMMER_SEEDS.includes(item.display_name)) {
-                            logger.log('info', 'Found Summer Seed in WebSocket data:', { name: item.display_name, qty: item.quantity });
-                            currentStockCache.latestSummerSeed = { ...item }; // Cache it
-                             if (!foundSummerSeedForBroadcast) { // Broadcast only the first one found in this update
-                                foundSummerSeedForBroadcast = item;
-                            }
-                        }
-                    }
-                }
+        const eggMsg = formatItemList(stockData.egg_stock, "EGG STOCKS 🥚");
+        if (eggMsg) await broadcastToSubscribers(eggMsg, 'egg_stock_update');
+
+        const eventShopMsg = formatItemList(stockData.eventshop_stock, "EVENT SHOP 🎉");
+        if (eventShopMsg) await broadcastToSubscribers(eventShopMsg, 'eventshop_update');
+
+        const cosmeticMsg = formatItemList(stockData.cosmetic_stock, "COSMETICS SHOP 🎨");
+        if (cosmeticMsg) await broadcastToSubscribers(cosmeticMsg, 'cosmetics_update');
+        
+        const seedMsg = formatItemList(stockData.seed_stock, "SEED SHOP 🌱");
+        if (seedMsg) await broadcastToSubscribers(seedMsg, 'seed_stock_update');
+        
+        const gearMsg = formatItemList(stockData.gear_stock, "GEAR SHOP 🛠️");
+        if (gearMsg) await broadcastToSubscribers(gearMsg, 'gear_stock_update');
+
+        // --- Special Handling for Summer Seeds ---
+        if (Array.isArray(stockData.seed_stock)) {
+            const summerSeedsInStock = stockData.seed_stock.filter(item =>
+                SUMMER_SEEDS.includes(item.display_name) && item.quantity > 0
+            );
+            if (summerSeedsInStock.length > 0) {
+                const summerMsg = formatItemList(summerSeedsInStock, "SUMMER SEEDS ☀️");
+                if (summerMsg) await broadcastToSubscribers(summerMsg, 'summer_seeds_update');
+                // Update cache for new subscribers
+                if (summerSeedsInStock[0]) currentStockCache.latestSummerSeed = { ...summerSeedsInStock[0] };
             }
         }
         
-        if (foundRareItemForBroadcast) {
-            const notification = `🎯 Rare Item Alert!\n${foundRareItemForBroadcast.display_name} is now available!\nQuantity: ${foundRareItemForBroadcast.quantity}`;
-            await broadcastToSubscribers(notification, 'rare_item_update');
-        }
-        
-        if (foundSummerSeedForBroadcast) {
-             const notification = `🌞 Summer Seed Update!\n${foundSummerSeedForBroadcast.display_name} seeds are available!\nQuantity: ${foundSummerSeedForBroadcast.quantity}`;
-             await broadcastToSubscribers(notification, 'summer_seed_update');
-        }
+        // --- Special Handling for Rare Items ---
+        let allRareItemsFound = [];
+        let allPriorityRareItemsFound = [];
+        const stockKeysToCheckForRare = ['seed_stock', 'gear_stock', 'egg_stock', 'cosmetic_stock', 'eventshop_stock'];
+        stockKeysToCheckForRare.forEach(key => {
+            if (Array.isArray(stockData[key])) {
+                stockData[key].forEach(item => {
+                    if (item && item.display_name && item.quantity > 0 && isRareItem(item.display_name)) {
+                        const rareItemInfo = { ...item, type: key.replace('_stock', '') }; // Add type for context
+                        if (isPriorityRareItem(item.display_name)) {
+                            allPriorityRareItemsFound.push(rareItemInfo);
+                        } else {
+                            allRareItemsFound.push(rareItemInfo);
+                        }
+                    }
+                });
+            }
+        });
 
-        if (!foundRareItemForBroadcast && !foundSummerSeedForBroadcast) {
-            logger.log('info', 'External WebSocket message processed, but no new rare items or summer seeds triggered an immediate broadcast from this specific update.');
+        if (allPriorityRareItemsFound.length > 0 || allRareItemsFound.length > 0) {
+            let rareBroadcastMsg = "--- RARE ITEM ALERT 🌟 ---\n";
+            if (allPriorityRareItemsFound.length > 0) {
+                rareBroadcastMsg += "\n🔥 SUPER RARES! 🔥\n";
+                allPriorityRareItemsFound.forEach(item => {
+                    rareBroadcastMsg += `🔸 ${item.display_name} (${item.type})\n   Qty: ${item.quantity}, Ends: ${formatTimeRemaining(item.end_date_unix)}\n`;
+                });
+                // Update cache for new subscribers (take the first priority rare)
+                currentStockCache.latestRareItem = { ...allPriorityRareItemsFound[0] };
+            }
+            if (allRareItemsFound.length > 0) {
+                rareBroadcastMsg += "\n📦 Other Rares:\n";
+                allRareItemsFound.forEach(item => {
+                    rareBroadcastMsg += `🔸 ${item.display_name} (${item.type})\n   Qty: ${item.quantity}, Ends: ${formatTimeRemaining(item.end_date_unix)}\n`;
+                });
+                // Update cache if no priority ones were found
+                if (!currentStockCache.latestRareItem && allRareItemsFound[0]) {
+                     currentStockCache.latestRareItem = { ...allRareItemsFound[0] };
+                }
+            }
+            await broadcastToSubscribers(rareBroadcastMsg, 'rare_item_alert');
         }
 
     } catch (error) {
-        logger.log('error', 'Error processing EXTERNAL WebSocket message:', { error: error.message, dataReceived: rawDataString.substring(0, 200) + "...", stack: error.stack });
+        logger.log('ERROR', 'Error processing EXTERNAL WebSocket message:', { error: error.message, dataPreview: rawDataString.substring(0,200), stack: error.stack });
     }
-});
+}
 
-ws.on('error', (error) => {
-    logger.log('error', 'EXTERNAL WebSocket error:', { error: error.message, stack: error.stack });
-});
 
-ws.on('close', (code, reason) => {
-    logger.log('info', 'EXTERNAL WebSocket connection closed.', { code, reason: reason.toString() });
-});
-
-// --- Function to Send Current Stock Summary (from cache) to a Facebook User ---
+// --- Function to Send Current Cached Stock Summary to a New Facebook Subscriber ---
 async function sendCurrentStockSummary(senderId) {
-    logger.log('info', `Sending current stock summary (from cache) to Facebook User ${senderId}`);
+    logger.log('INFO', `Sending current cached stock summary to FB User ${senderId}`);
     let summaryParts = [];
-
     const rareItem = currentStockCache.latestRareItem;
     if (rareItem && rareItem.display_name) {
-        summaryParts.push(`Latest Rare Item (from cache):\n${rareItem.display_name}\nQuantity: ${rareItem.quantity}`);
+        summaryParts.push(`Latest Rare Item (cached):\n${rareItem.display_name} (Qty: ${rareItem.quantity}, Ends: ${formatTimeRemaining(rareItem.end_date_unix)})`);
     }
-
     const summerItem = currentStockCache.latestSummerSeed;
     if (summerItem && summerItem.display_name) {
-        summaryParts.push(`Latest Summer Seed (from cache):\n${summerItem.display_name}\nQuantity: ${summerItem.quantity}`);
+        summaryParts.push(`Latest Summer Seed (cached):\n${summerItem.display_name} (Qty: ${summerItem.quantity}, Ends: ${formatTimeRemaining(summerItem.end_date_unix)})`);
     }
 
     if (summaryParts.length > 0) {
-        const fullMessage = "Here's the latest stock information I have (this is from my cache and updates when new items appear in the game feed):\n\n" + summaryParts.join("\n\n---\n\n");
+        const fullMessage = "Welcome! Here's the latest stock info I have from my cache (updates as new items appear):\n\n" + summaryParts.join("\n\n---\n\n");
         await sendTextMessage(senderId, fullMessage);
     } else {
-        await sendTextMessage(senderId, "My cache is currently empty for rare items/summer seeds. You'll be notified when new ones appear in the game feed!");
+        await sendTextMessage(senderId, "Welcome! My stock cache is currently empty. You'll be notified of new items as they come from the game feed!");
     }
 }
 
@@ -194,17 +322,17 @@ async function subscribeUser(senderId) {
 
         if (!existingSubscriber) {
             await subscribersCollection.insertOne({ senderId: senderId, subscribedAt: new Date() });
-            logger.log('info', `Facebook User ${senderId} subscribed.`);
+            logger.log('INFO', `Facebook User ${senderId} subscribed.`);
             await sendTextMessage(senderId, "You've been subscribed to notifications!");
             await sendCurrentStockSummary(senderId);
         } else {
-            logger.log('info', `Facebook User ${senderId} is already subscribed.`);
-            await sendTextMessage(senderId, "You're already subscribed! Here's the latest stock info I have from my cache:");
+            logger.log('INFO', `Facebook User ${senderId} is already subscribed.`);
+            await sendTextMessage(senderId, "You're already subscribed! Here's the latest cached stock info:");
             await sendCurrentStockSummary(senderId);
         }
     } catch (error) {
-        logger.log('error', `Error in subscribeUser for Facebook User ${senderId}:`, { error: error.message, stack: error.stack });
-        await sendTextMessage(senderId, "Sorry, there was an error subscribing you. Please try again later.");
+        logger.log('ERROR', `Error in subscribeUser for FB User ${senderId}:`, { error: error.message });
+        await sendTextMessage(senderId, "Sorry, there was an error subscribing you.");
     }
 }
 
@@ -213,29 +341,32 @@ async function unsubscribeUser(senderId) {
         const database = await connectToDatabase();
         const subscribersCollection = database.collection(COLLECTION_NAME);
         const result = await subscribersCollection.deleteOne({ senderId: senderId });
-
         if (result.deletedCount > 0) {
-            logger.log('info', `Facebook User ${senderId} unsubscribed.`);
-            await sendTextMessage(senderId, "You've been unsubscribed from notifications.");
+            logger.log('INFO', `Facebook User ${senderId} unsubscribed.`);
+            await sendTextMessage(senderId, "You've been unsubscribed.");
         } else {
-            logger.log('info', `Facebook User ${senderId} was not subscribed or already unsubscribed.`);
-            await sendTextMessage(senderId, "You weren't subscribed, so no action was taken.");
+            logger.log('INFO', `Facebook User ${senderId} was not subscribed.`);
+            await sendTextMessage(senderId, "You weren't subscribed.");
         }
     } catch (error) {
-        logger.log('error', `Error in unsubscribeUser for Facebook User ${senderId}:`, { error: error.message, stack: error.stack });
-        await sendTextMessage(senderId, "Sorry, there was an error unsubscribing you. Please try again later.");
+        logger.log('ERROR', `Error in unsubscribeUser for FB User ${senderId}:`, { error: error.message });
+        await sendTextMessage(senderId, "Sorry, there was an error unsubscribing you.");
     }
 }
 
-async function broadcastToSubscribers(notificationMessage, type) {
+async function broadcastToSubscribers(notificationMessage, typeForLogging) {
     try {
         const database = await connectToDatabase();
+        if (!database) {
+            logger.log('ERROR', `Cannot broadcast: No database connection for ${typeForLogging}`);
+            return;
+        }
         const subscribersCollection = database.collection(COLLECTION_NAME);
         const allSubscribers = await subscribersCollection.find({}).toArray();
 
-        logger.log('info', `Broadcasting (type: ${type}): "${notificationMessage}" to ${allSubscribers.length} subscribed Facebook users.`);
+        logger.log('INFO', `Broadcasting (type: ${typeForLogging}): "${notificationMessage.substring(0,100)}..." to ${allSubscribers.length} subscribed FB users.`);
         if (allSubscribers.length === 0) {
-            logger.log('info', 'No Facebook subscribers to broadcast to.');
+            logger.log('INFO', 'No Facebook subscribers to broadcast to.');
             return;
         }
 
@@ -246,31 +377,31 @@ async function broadcastToSubscribers(notificationMessage, type) {
         const results = await Promise.allSettled(sendPromises);
         results.forEach((result, index) => {
             if (result.status === 'rejected') {
-                logger.log('error', `Failed to broadcast to Facebook User ${allSubscribers[index].senderId}:`, { error: result.reason ? result.reason.message : "Unknown reason" });
+                logger.log('ERROR', `Failed to broadcast to FB User ${allSubscribers[index].senderId}:`, { error: result.reason ? result.reason.message : "Unknown reason" });
             }
         });
-        logger.log('info', 'Broadcast to Facebook users completed.');
+        logger.log('INFO', `Broadcast type '${typeForLogging}' to Facebook users completed.`);
 
     } catch (error) {
-        logger.log('error', 'Error in broadcastToSubscribers (to Facebook users):', { error: error.message, stack: error.stack });
+        logger.log('ERROR', `Error in broadcastToSubscribers (to FB users for ${typeForLogging}):`, { error: error.message });
     }
 }
 
-// --- Express routes for Facebook Messenger webhook ---
+// --- Express Routes for Facebook Messenger Webhook ---
 app.get('/webhook', (req, res) => {
     const mode = req.query['hub.mode'];
     const token = req.query['hub.verify_token'];
     const challenge = req.query['hub.challenge'];
     if (mode && token) {
         if (mode === 'subscribe' && token === VERIFY_TOKEN) {
-            logger.log('info',"Facebook WEBHOOK_VERIFIED - Sending challenge back");
+            logger.log('INFO',"Facebook WEBHOOK_VERIFIED - Sending challenge back");
             res.status(200).send(challenge);
         } else {
-            logger.log('error',"Facebook Webhook verification failed. Mode or token mismatch.");
+            logger.log('ERROR',"Facebook Webhook verification failed.");
             res.sendStatus(403);
         }
     } else {
-        logger.log('warn', "Missing mode or token in Facebook GET /webhook request");
+        logger.log('WARNING', "Missing params in Facebook GET /webhook request");
         res.sendStatus(400);
     }
 });
@@ -278,38 +409,39 @@ app.get('/webhook', (req, res) => {
 app.post('/webhook', async (req, res) => {
     const body = req.body;
     if (body.object === 'page') {
-        const processingPromises = body.entry.map(async (entry) => {
+        // Acknowledge receipt to Facebook quickly.
+        // Actual processing happens after the response is sent.
+        res.status(200).send('EVENT_RECEIVED'); 
+        
+        // Process asynchronously
+        for (const entry of body.entry) {
             if (entry.messaging && entry.messaging[0]) {
                 const webhookEvent = entry.messaging[0];
                 const senderId = webhookEvent.sender.id;
-                if (webhookEvent.message) {
-                    await handleMessage(senderId, webhookEvent.message);
-                } else if (webhookEvent.postback) {
-                    logger.log('info', 'Received Facebook postback (not handled)', { senderId, postback: webhookEvent.postback });
-                } else {
-                    logger.log('info', 'Received unhandled Facebook webhook event type', { senderId, event: webhookEvent });
+                try {
+                    if (webhookEvent.message) {
+                        await handleFacebookUserMessage(senderId, webhookEvent.message);
+                    } else if (webhookEvent.postback) {
+                        logger.log('INFO', 'Received Facebook postback (not handled)', { senderId });
+                    }
+                } catch (err) {
+                     logger.log('ERROR', 'Error processing an individual webhook event', { senderId, error: err.message });
                 }
             } else {
-                logger.log('warn', 'Received Facebook entry with no messaging array or empty messaging array', { entry });
+                logger.log('WARNING', 'Received Facebook entry with no/empty messaging array', { entryId: entry.id });
             }
-        });
-        try {
-            await Promise.allSettled(processingPromises);
-        } catch (error) {
-            logger.log('error', 'Error processing Facebook webhook entries', { error: error.message, stack: error.stack });
         }
-        res.status(200).send('EVENT_RECEIVED');
     } else {
-        logger.log('warn', "POST /webhook not from a Facebook page subscription", { object: body.object });
+        logger.log('WARNING', "POST /webhook not from a Facebook page subscription");
         res.sendStatus(404);
     }
 });
 
-// --- Message handling (for messages from Facebook Users) ---
-async function handleMessage(senderId, message) {
+// --- Message Handling (for messages from Facebook Users) ---
+async function handleFacebookUserMessage(senderId, message) { // Renamed for clarity
     if (message.text) {
         const text = message.text.toLowerCase().trim();
-        logger.log('info', `Handling Facebook message from ${senderId}: "${text}"`);
+        logger.log('INFO', `Handling Facebook message from ${senderId}: "${text}"`);
         try {
             if (text === 'subscribe') {
                 await subscribeUser(senderId);
@@ -319,37 +451,35 @@ async function handleMessage(senderId, message) {
                 await sendTextMessage(senderId, 'Available commands:\nsubscribe - Get notifications\nunsubscribe - Stop notifications\nhelp - Show this message');
             } else {
                 await sendTextMessage(senderId, "Sorry, I didn't understand that. Type 'help' for commands.");
-                logger.log('info', `Unrecognized command from Facebook User ${senderId}: "${text}"`);
             }
         } catch (error) {
-            logger.log('error', `Error in handleMessage for Facebook User ${senderId} processing "${text}":`, { error: error.message, stack: error.stack });
-            try {
-                await sendTextMessage(senderId, "Sorry, I encountered an error processing your request. Please try again.");
-            } catch (sendError) {
-                logger.log('error', `Failed to send error message to Facebook User ${senderId}:`, { error: sendError.message });
-            }
+            logger.log('ERROR', `Error in handleFacebookUserMessage for ${senderId} ("${text}"):`, { error: error.message });
+            await sendTextMessage(senderId, "Sorry, an error occurred.");
         }
     } else if (message.attachments) {
-        logger.log('info', `Received attachment from Facebook User ${senderId} (not handled).`);
-        await sendTextMessage(senderId, "Thanks for the attachment! I can't process those yet.");
-    } else {
-        logger.log('info', `Received non-text, non-attachment message from Facebook User ${senderId} (not handled).`, { message });
+        logger.log('INFO', `Received attachment from FB User ${senderId} (not handled).`);
+        await sendTextMessage(senderId, "I can't process attachments yet.");
     }
 }
+
+// --- Initialize External WebSocket Connection on Startup ---
+// (Vercel will run this when the function cold starts)
+connectWebSocket();
+
 
 // Export the app for Vercel
 module.exports = app;
 
 // Optional: If running locally for testing
 /*
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, async () => {
-    console.log(`Server is running on port ${PORT}`);
+const PORT_LOCAL = process.env.PORT || 3000;
+app.listen(PORT_LOCAL, async () => {
+    logger.log('INFO', `Local server running on port ${PORT_LOCAL}`);
     try {
-        await connectToDatabase(); // Connect to DB when server starts locally
-        console.log("Local server connected to MongoDB.");
+        await connectToDatabase();
     } catch (e) {
-        console.error("Local server failed to connect to MongoDB on startup:", e);
+        // Error already logged by connectToDatabase
     }
+    // External WebSocket connection is initiated globally above
 });
 */
