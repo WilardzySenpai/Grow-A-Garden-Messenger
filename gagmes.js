@@ -219,6 +219,59 @@ app.post('/webhook', (req, res) => {
     }
 });
 
+// Subscription management
+let subscribers = new Set(); // Using a Set to avoid duplicate senderIds
+
+function subscribeUser(senderId) {
+    if (!subscribers.has(senderId)) {
+        subscribers.add(senderId);
+        logger.log('info', `User ${senderId} subscribed.`);
+        sendTextMessage(senderId, "You've been subscribed to notifications!");
+    } else {
+        logger.log('info', `User ${senderId} is already subscribed.`);
+        sendTextMessage(senderId, "You're already subscribed!");
+    }
+    // For debugging, you can log the current subscribers
+    console.log("Current subscribers:", Array.from(subscribers));
+}
+
+function unsubscribeUser(senderId) {
+    if (subscribers.has(senderId)) {
+        subscribers.delete(senderId);
+        logger.log('info', `User ${senderId} unsubscribed.`);
+        sendTextMessage(senderId, "You've been unsubscribed from notifications.");
+    } else {
+        logger.log('info', `User ${senderId} was not subscribed.`);
+        sendTextMessage(senderId, "You weren't subscribed.");
+    }
+}
+
+function broadcastToSubscribers(notificationMessage, type) { // Added 'type' as it was in your ws handler
+    logger.log('info', `Broadcasting ${type}: ${notificationMessage} to ${subscribers.size} subscribers.`);
+    subscribers.forEach(senderId => {
+        sendTextMessage(senderId, notificationMessage);
+    });
+}
+
+
+// Your existing handleMessage function:
+function handleMessage(senderId, message) {
+    if (message.text) {
+        const text = message.text.toLowerCase();
+
+        if (text.includes('subscribe')) {
+            subscribeUser(senderId);
+        } else if (text.includes('unsubscribe')) { // Added unsubscribe for completeness
+            unsubscribeUser(senderId);
+        } else if (text.includes('help')) {
+            sendTextMessage(senderId, 'Available commands:\n/subscribe - Get notifications\n/unsubscribe - Stop notifications\n/help - Show this message');
+        }
+        else {
+           sendTextMessage(senderId, "Sorry, I didn't understand that command. Type 'help' for options.");
+        }
+    }
+}
+
 // Message handling
 function handleMessage(senderId, message) {
     if (message.text) {
