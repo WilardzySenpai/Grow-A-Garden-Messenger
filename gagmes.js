@@ -178,9 +178,11 @@ ws.on('message', async (data) => {
 });
 
 // Express routes for Facebook Messenger webhook
+// TEMPORARY DEBUGGING - REMOVE AFTER TESTING
+const EXPECTED_VERIFY_TOKEN = 'mySuperSecretToken123';
 app.get('/webhook', (req, res) => {
-    if (req.query['hub.verify_token'] === VERIFY_TOKEN) {
-        res.send(req.query['hub.challenge']);
+    if (req.query['hub.verify_token'] === EXPECTED_VERIFY_TOKEN && req.query['hub.mode'] === 'subscribe') {
+        res.status(200).send(req.query['hub.challenge']);
     } else {
         res.sendStatus(403);
     }
@@ -220,11 +222,4 @@ function handleMessage(senderId, message) {
     }
 }
 
-// Remove direct server listen for Vercel
-// const PORT = process.env.PORT || 3000;
-// app.listen(PORT, () => {
-//     console.log(`Server is running on port ${PORT}`);
-// });
-
-// Export the app for Vercel
 module.exports = app;
