@@ -178,12 +178,22 @@ ws.on('message', async (data) => {
 });
 
 // Express routes for Facebook Messenger webhook
-// TEMPORARY DEBUGGING - REMOVE AFTER TESTING
-const EXPECTED_VERIFY_TOKEN = 'mySuperSecretToken123';
 app.get('/webhook', (req, res) => {
-    if (req.query['hub.verify_token'] === EXPECTED_VERIFY_TOKEN && req.query['hub.mode'] === 'subscribe') {
-        res.status(200).send(req.query['hub.challenge']);
+    console.log("Received GET /webhook request");
+    console.log("Query params:", req.query);
+    console.log("Expected VERIFY_TOKEN from env:", process.env.VERIFY_TOKEN);
+    console.log("Received hub.verify_token:", req.query['hub.verify_token']);
+    console.log("Received hub.mode:", req.query['hub.mode']);
+
+    const mode = req.query['hub.mode'];
+    const token = req.query['hub.verify_token'];
+    const challenge = req.query['hub.challenge'];
+
+    if (mode === 'subscribe' && token === process.env.VERIFY_TOKEN) {
+        console.log("WEBHOOK_VERIFIED - Sending challenge back");
+        res.status(200).send(challenge);
     } else {
+        console.log("Webhook verification failed. Mode or token mismatch.");
         res.sendStatus(403);
     }
 });
