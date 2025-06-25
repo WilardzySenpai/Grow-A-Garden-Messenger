@@ -13,8 +13,8 @@ const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 
 // MongoDB Configuration
-const MONGODB_URI = process.env.MONGODB_URI; // mongodb+srv://chi:chichi3819@cluster0.xffuh81.mongodb.net/gagmes
-const DB_NAME = 'gagmes'; // Or extract from URI if needed, but 'gagmes' is specified
+const MONGODB_URI = process.env.MONGODB_URI;
+const DB_NAME = 'gagmes';
 const COLLECTION_NAME = 'subscribers';
 
 let dbClient;
@@ -169,6 +169,8 @@ async function subscribeUser(senderId) {
             await subscribersCollection.insertOne({ senderId: senderId, subscribedAt: new Date() });
             logger.log('info', `User ${senderId} subscribed.`);
             await sendTextMessage(senderId, "You've been subscribed to notifications!");
+            // Send a test notification immediately after subscribing
+            await sendTextMessage(senderId, "[Test] You will receive notifications here. This confirms Messenger delivery is working.");
         } else {
             logger.log('info', `User ${senderId} is already subscribed.`);
             await sendTextMessage(senderId, "You're already subscribed!");
